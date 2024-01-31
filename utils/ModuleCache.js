@@ -1,12 +1,14 @@
 'use strict';
 
+const {createMemo} = require("./createMemo");
 exports.__esModule = true;
 
 const log = require('debug')('eslint-module-utils:ModuleCache');
 
+
 class ModuleCache {
-  constructor(map) {
-    this.map = map || new Map();
+  constructor() {
+    this.map = createMemo();
   }
 
   /**
@@ -21,8 +23,8 @@ class ModuleCache {
   }
 
   get(cacheKey, settings) {
-    if (this.map.has(cacheKey)) {
-      const f = this.map.get(cacheKey);
+    const f = this.map.get(cacheKey);
+    if (f) {
       // check freshness
       if (process.hrtime(f.lastSeen)[0] < settings.lifetime) { return f.result; }
     } else {

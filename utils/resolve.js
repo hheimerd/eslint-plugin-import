@@ -6,7 +6,6 @@ const fs = require('fs');
 const Module = require('module');
 const path = require('path');
 
-const hashObject = require('./hash').hashObject;
 const ModuleCache = require('./ModuleCache').default;
 const pkgDir = require('./pkgDir').default;
 
@@ -16,6 +15,11 @@ exports.CASE_SENSITIVE_FS = CASE_SENSITIVE_FS;
 const ERROR_NAME = 'EslintPluginImportResolveError';
 
 const fileExistsCache = new ModuleCache();
+
+function isRelative(path) {
+  return path === '.' || path.startsWith('./') || path.startsWith('../');
+}
+
 
 // Polyfill Node's `Module.createRequireFromPath` if not present (added in Node v10.12.0)
 // Use `Module.createRequire` if available (added in Node v12.2.0)
@@ -29,13 +33,15 @@ const createRequire = Module.createRequire || Module.createRequireFromPath || fu
   return mod.exports;
 };
 
+let sourceFileRequire;
 function tryRequire(target, sourceFile) {
   let resolved;
   try {
     // Check if the target exists
     if (sourceFile != null) {
       try {
-        resolved = createRequire(path.resolve(sourceFile)).resolve(target);
+        sourceFileRequire ??= createRequire(path.resolve(sourceFile));
+        resolved = sourceFileRequire.resolve(target);
       } catch (e) {
         resolved = require.resolve(target);
       }
@@ -49,6 +55,12 @@ function tryRequire(target, sourceFile) {
 
   // If the target exists then return the loaded module
   return require(resolved);
+}
+
+const packageRegexp = /^@?\w/;
+
+function isPackageIdentifier(identifier) {
+  return packageRegexp.test(identifier);
 }
 
 // https://stackoverflow.com/a/27382838
@@ -84,8 +96,6 @@ function relative(modulePath, sourceFile, settings) {
   return fullResolve(modulePath, sourceFile, settings).path;
 }
 
-let prevSettings = null;
-let memoizedHash = '';
 function fullResolve(modulePath, sourceFile, settings) {
   // check if this is a bonus core module
   const coreSet = new Set(settings['import/core-modules']);
@@ -93,20 +103,17 @@ function fullResolve(modulePath, sourceFile, settings) {
 
   const sourceDir = path.dirname(sourceFile);
 
-  if (prevSettings !== settings) {
-    memoizedHash = hashObject(settings).digest('hex');
-    prevSettings = settings;
-  }
-
-  const cacheKey = sourceDir + memoizedHash + modulePath;
+  let cachePath = isPackageIdentifier(modulePath)
+      ? [modulePath]
+      : [sourceDir, modulePath];
 
   const cacheSettings = ModuleCache.getSettings(settings);
 
-  const cachedPath = fileExistsCache.get(cacheKey, cacheSettings);
+  const cachedPath = fileExistsCache.get(cachePath, cacheSettings);
   if (cachedPath !== undefined) { return { found: true, path: cachedPath }; }
 
   function cache(resolvedPath) {
-    fileExistsCache.set(cacheKey, resolvedPath);
+    fileExistsCache.set(cachePath, resolvedPath);
   }
 
   function withResolver(resolver, config) {
@@ -126,11 +133,19 @@ function fullResolve(modulePath, sourceFile, settings) {
   const configResolvers = settings['import/resolver']
     || { node: settings['import/resolve'] }; // backward compatibility
 
-  const resolvers = resolverReducer(configResolvers, new Map());
+  const resolversMap = resolverReducer(configResolvers, new Map());
+  const resolversEntries = [...resolversMap.entries()].sort(([, config1], [, config2]) => {
+    if (typeof config1 !== "object" || 'priority' in config1 === false) {
+      return 1;
+    }
+    if (typeof config2 !== "object" || 'priority' in config2 === false) {
+      return -1;
+    }
 
-  for (const pair of resolvers) {
-    const name = pair[0];
-    const config = pair[1];
+    return config2.priority - config1.priority
+  })
+
+  for (const [name, config] of resolversEntries) {
     const resolver = requireResolver(name, sourceFile);
     const resolved = withResolver(resolver, config);
 
@@ -173,11 +188,20 @@ function resolverReducer(resolvers, map) {
 function getBaseDir(sourceFile) {
   return pkgDir(sourceFile) || process.cwd();
 }
+
+const resolversMap = new Map();
 function requireResolver(name, sourceFile) {
+  if (resolversMap.has(name)) {
+    return resolversMap.get(name);
+  }
+
   // Try to resolve package with conventional name
-  const resolver = tryRequire(`eslint-import-resolver-${name}`, sourceFile)
-    || tryRequire(name, sourceFile)
-    || tryRequire(path.resolve(getBaseDir(sourceFile), name));
+  let resolver;
+  if (!path.isAbsolute(name) && !isRelative(name)) {
+    resolver = tryRequire(`eslint-import-resolver-${name}`, sourceFile)
+  }
+  resolver ??= tryRequire(name, sourceFile)
+  resolver ??= tryRequire(path.resolve(getBaseDir(sourceFile), name));
 
   if (!resolver) {
     const err = new Error(`unable to load resolver "${name}".`);
@@ -189,6 +213,8 @@ function requireResolver(name, sourceFile) {
     err.name = ERROR_NAME;
     throw err;
   }
+
+  resolversMap.set(name, resolver);
 
   return resolver;
 }
